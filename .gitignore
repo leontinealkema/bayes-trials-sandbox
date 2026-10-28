@@ -7,6 +7,8 @@ claude-project-context.md
 # Rendered output (rebuild with quarto)
 *.html
 *.pdf
+# ...except the PDF of each post, shared from the README
+!adaptive-designs/adaptive-design101.pdf
 # keep the figures of the .md (GitHub) version of a post
 **/*_files/*
 !**/*_files/figure-commonmark/

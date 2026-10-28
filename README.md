@@ -6,7 +6,7 @@ This is [Leontine Alkema](https://leontinealkema.github.io/)'s sandbox for learn
 
 | Folder | Topic | Post |
 |----|----|----|
-| [`adaptive-designs/`](adaptive-designs/) | How adaptive designs work: a phase II pick-the-winner example (stopping, arm dropping and response-adaptive randomization, simulated with the adaptr R package) | [Bayesian adaptive designs: a worked example](adaptive-designs/adaptive-design101.md) |
+| [`adaptive-designs/`](adaptive-designs/) | How adaptive designs work: a phase II pick-the-winner example (stopping, arm dropping and response-adaptive randomization, simulated with the adaptr R package) | [Bayesian adaptive designs: a worked example](adaptive-designs/adaptive-design101.md) ([PDF](adaptive-designs/adaptive-design101.pdf)) |
 
 ## Structure of a topic folder
 
