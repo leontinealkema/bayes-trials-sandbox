@@ -1,0 +1,355 @@
+---
+title: "Bayesian adaptive designs: a worked example using `adaptr`"
+author: "Leontine Alkema"
+date: today
+bibliography: references.bib
+link-citations: true
+format:
+  html:
+    toc: true
+    toc-location: left
+    embed-resources: true
+    theme: cosmo
+    fig-width: 8
+    fig-height: 4.5
+  pdf:
+    toc: false
+    papersize: a4
+    geometry: margin=2cm
+    fig-width: 7
+    fig-height: 4.5
+    include-in-header:
+      text: |
+        \usepackage{etoolbox}
+        \AtBeginEnvironment{longtable}{\footnotesize}
+  gfm:
+    toc: false
+    fig-width: 8
+    fig-height: 4.5
+    fig-dpi: 150
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(purrr)
+  library(tidyr)
+  library(ggplot2)
+})
+stopifnot(requireNamespace("adaptr", quietly = TRUE))
+
+# This post only READS the saved results of adaptive-designs/run_all.R.
+topic_dir   <- here::here("adaptive-designs")
+dir_results <- file.path(topic_dir, "results/")
+source(file.path(topic_dir, "R", "helpers.R"))
+options(knitr.table.format = "pipe")
+
+cal    <- readRDS(paste0(dir_results, "calibration.rds"))
+single <- readRDS(paste0(dir_results, "single_trials.rds"))
+scen_ids <- c("pick_the_winner", "futility_screen", "close_effects")
+scen <- scen_ids |>
+  set_names() |>
+  map(\(id) readRDS(paste0(dir_results, "scenario_", id, ".rds")))
+# this post calls the null scenario "No arm works" (run_all.R: "Futility screen")
+scen$futility_screen$title <- sub("Futility screen", "No arm works", scen$futility_screen$title)
+
+# Key numbers used in the text: v("pick_the_winner", "Fixed", "Expected sample size")
+mvs <- map(scen, \(S) map(set_names(S$designs), \(d) metric_values(S, d)))
+v   <- \(id, d, m) mvs[[id]][[d]][[m]]
+pct <- \(x, acc = 1) scales::percent(x, accuracy = acc)
+n0  <- \(x) format(round(x), big.mark = ",")
+
+# Calibrated thresholds (six-arm trial)
+thr_tab <- cal$six_arm$table
+thr <- set_names(thr_tab$`Superiority threshold`, thr_tab$Design)
+
+# Fixed design: expected arm sizes (square-root rule) and independence approximation of x
+s6      <- family_settings$six_arm
+K       <- length(s6$arms) - 1
+ctrl_sh <- sqrt(K) / (sqrt(K) + K)
+n_ctrl  <- round(s6$max_n * ctrl_sh)
+n_arm   <- round(s6$max_n * (1 - ctrl_sh) / K)
+x_sidak <- (1 - cal$settings$target)^(1 / K)
+
+# Events in the example trial, designs (b) and (c)
+ev_b   <- trial_events(single$typical$hists[[1]])
+ev_c   <- trial_events(single$typical$hists[[2]])
+n_at   <- \(e, ev = ev_c) ev$n[ev$event == e][1]
+
+# Pick the winner: median allocation share of arm E at x0 (history data; the
+# share used for participants randomized up to x0), and mean participants per arm
+alloc_E    <- \(d, x0) single$history[[d]] |> filter(arm == "E", abs(x - x0) < 1e-6) |> pull(mid)
+arm_mean_n <- \(id, d, a) scen[[id]]$mean_sizes |> filter(design == d, arm == a) |> pull(mean_n)
+conc       <- \(id, d) get_metric(scen[[id]], d, "prob_conclusive")
+# participant benefit: share of participants on the best arm (ratio of mean arm sizes,
+# as in glance_data()) and response rate among all trial participants
+share_best <- \(id, d) {
+  ms <- scen[[id]]$mean_sizes |> filter(design == d)
+  ms$mean_n[ms$arm == scen[[id]]$best] / sum(ms$mean_n)
+}
+resp_rate  <- \(id, d) v(id, d, "Response rate among trial participants")
+mc_se_max  <- sqrt(0.25 / scen$pick_the_winner$n_rep)   # largest Monte Carlo SE of a probability
+
+# Allocation rules by number of active experimental arms (5, 4, 3, 2, 1)
+ctrl_share_b <- single$alloc_fixed[["Control share (adaptr)"]]
+min_share_c  <- single$alloc_rar[["Minimum share per experimental arm"]]
+
+# Shorthands
+D_a <- "Fixed"; D_b <- "Stop/drop"; D_c <- "Stop/drop + RAR"
+# design labels as used in the text, for figures and tables
+design_lab <- c("(a) Fixed", "(b) Stop/drop", "(c) Stop/drop + RAR") |> set_names(design_names)
+pow  <- "Power: P(best arm taken forward)"; fg <- "P(false go: a useless arm taken forward)"
+ess  <- "Expected sample size"; nogo <- "P(no-go: control taken forward)"
+```
+
+::: {.callout-note title="About this post"}
+This post is part of my [sandbox](https://github.com/leontinealkema/bayes-trials-sandbox) of worked examples on Bayesian methods for clinical trial design. The examples use simple settings to show how a method works; they are not design recommendations. Questions, corrections and suggestions are very welcome! 
+:::
+
+Phase II trials may test several candidate treatments to decide which one, if any, deserves a large confirmatory phase III trial. A conventional design randomizes a fixed number of participants to each arm and looks at the data once, at the end. A Bayesian adaptive design looks at the data repeatedly as they come in and acts on what it sees: it drops arms that are unlikely to help, stops when a winner is clear, and can steer new participants toward arms that look promising.
+
+This post is a 101 on adaptive designs. Using an example trial, I set up a fixed design and two adaptive designs, and compare them in three scenarios. It is not a full overview of adaptive designs and their pros and cons, just an introduction to what they are and how they behave.
+
+All results come from simulations and analysis with the R package [adaptr](https://inceptdk.github.io/adaptr/index.html), version 1.5.0 [@adaptr2026; @granholm2022; @granholm2025]. The package handles many types of trials and designs and is a great resource.
+
+::: {.callout-tip title="What you can get out of this post"}
+I wrote this post to understand how Bayesian adaptive designs work in practice, beyond the general idea of "looking at the data as they come in". It walks through one example trial from start to finish. After reading it, you should be able to:
+
+- explain the building blocks of a Bayesian adaptive design: interim analyses, stopping, dropping arms, and response-adaptive randomization;
+- see why adaptive designs need a stricter decision threshold, and how that threshold is set by simulation;
+- read the operating characteristics of a design (power, false-go rate, sample size, participant benefit) and compare designs across scenarios;
+- judge when adaptation helps (one arm clearly works) and when it does not (no arm works, or effects that are too small for the trial).
+
+All code is in the repository, so you can rerun the simulations or change the settings.
+:::
+
+# The trial {#the-trial}
+
+**Objective.** Five candidate treatments, A–E, are compared with standard care (the ***control***, arm 0). The trial has to reach a ***go/no-go decision***: take one of A–E forward to phase III (a *go*), or none of them (a *no-go*). This is a selection question, not a confirmatory one: the aim is to find the arm worth a large trial, if there is one.
+
+**Participants and endpoint.** At most *300 participants* are randomized. The endpoint is a binary *response* (say, tumor response) that is known soon after treatment (the simulations assume no delay: each outcome is available at the next analysis). For participant $i$ on arm $k \in \{0, A, \dots, E\}$, the endpoint $y_i$ is the outcome of a Bernoulli draw, $y_i|p_{k[i]} \sim \text{Bernoulli}(p_{k[i]}),$ where $p_k$ is the unknown response rate of arm $k$ and $k[i]$ refers to the arm of participant $i$.
+
+**Prior and posterior densities for** $p_k$. We consider Bayesian designs, where decisions are made based on posterior probabilities. We use a simple setup with a uniform $\text{Beta}(1, 1)$ prior for each $p_k$. With $s_k$ responses among $n_k$ participants, its posterior is $p_k \mid \text{data} \sim \text{Beta}(1 + s_k,\; 1 + n_k - s_k)$.
+
+**Decision criterion.** The question for each arm is whether it is better than the control, $p_k > p_0$. With the posterior densities introduced above, the probability that arm $k$ has a higher response rate than the control is given by $P(p_k > p_0 \mid \text{data})$. We set the decision criterion to take an arm forward based on this probability: an arm can only be taken forward if this probability $P(p_k > p_0 \mid \text{data})$ exceeds a **threshold** $x$ close to 1 (more on how $x$ is obtained later). E.g., if $x=0.98$, and an arm exceeds the threshold, the interpretation is as follows: we take arm $k$ forward if we are at least 98% sure that this arm is better than standard care.
+
+**Operating characteristics.** The decision rule can go wrong in different ways, through a false go (taking forward a non-superior arm, i.e., a useless treatment is sent on to an expensive phase III trial) and a false no-go (not taking forward a superior arm). These error rates are frequentist properties that we can approximate by simulating many trials with known true response rates. We consider:
+
+- **False-go rate:** the probability of a go when *no* arm is better than the control. In scenarios where there is a better arm, we report the related probability that a useless arm (one no better than the control) is taken forward.
+- **Power:** the probability that the *best arm is taken forward* when one arm is truly better.
+
+**Scenarios.** Operating characteristics depend on the true response rates, so they are computed under an assumed set of rates, a *scenario*. In the examples here, we assume that standard care has a response rate of `r pct(s6$null_rate)`, and we consider three scenarios:
+
+| Scenario            | True response rates              |
+|---------------------|----------------------------------|
+| **Pick the winner** | E 40%, all other arms 15%        |
+| **No arm works**    | All arms 15%                     |
+| **Close effects**   | E 25%, D 20%, all other arms 15% |
+
+
+**Choosing the threshold** $x$ **in the decision criterion.** The value for $x$ sets the trade-off between the two errors: a stricter (higher) $x$ lowers the false-go rate, but it also lowers the power. We choose $x$ such that the false-go rate in the null scenario ("No arm works", in which no arm is better than the control) is at most **`r pct(cal$settings$target)`**, a common error level for phase II, and then look at the power that each design achieves. This step is called *calibration*; the next section explains how it is done for each design.
+
+# Designs
+
+We consider a fixed design and two adaptive designs.
+
+## Fixed design
+
+The conventional fixed design randomizes all 300 participants and analyzes the data **once**, at the end.
+
+**Allocation.** We follow the square-root allocation approach [@viele2020control] to (approximately) maximize the precision of the comparisons with control. In this approach, with $K$ experimental arms, the control gets $\sqrt{K}$ shares and each experimental arm one share, so relatively, the control's share is $\sqrt{K} / (\sqrt{K} + K)$. For our setting with $K = 5$, that is about `r n_ctrl` participants on control and `r n_arm` on each experimental arm.
+
+**Decision.** At n = 300, compute $P(p_k > p_0 \mid \text{data})$ for each of the five experimental arms. If at least one exceeds $x$, it is a go and the most promising arm is taken forward. Otherwise, keep the control (a no-go).
+
+**Choosing** $x$. We choose $x$ such that the false-go rate is at most `r pct(cal$settings$target)` in the null scenario ("No arm works"). We obtain the value through simulation (see [Calibrating the designs](#calibrating-the-designs)): $x =$ `r round(thr[[D_a]], 3)`.
+
+<!-- This is close to a simple approximation. Under the null scenario, each arm's $P(p_k > p_0 \mid \text{data})$ exceeds $x$ with probability of about $1 - x$. If the five comparisons were independent, the false-go rate would be $1 - x^5$, and setting this to `r pct(cal$settings$target)` gives $x =$ `r round(x_sidak, 3)`. The comparisons share the control, which makes them positively correlated, so a slightly lower threshold suffices. -->
+
+## Adaptive designs
+
+We introduce two adaptive designs. These designs use the same decision criterion and the same maximum sample size of 300 as the fixed design but analyze the data repeatedly. We consider the stop/drop design and the stop/drop design with additional response-adaptive randomization (RAR). An overview of designs is given in the table:
+
+| Design | Interim analyses, stopping, arm dropping | Response-adaptive randomization (RAR) |
+|------------------------|------------------------|------------------------|
+| **(a) Fixed** | No: one analysis at n = 300 | No |
+| **(b) Stop/drop** | Yes: every 30 participants, from n = 60 | No |
+| **(c) Stop/drop + RAR** | Yes: same schedule as (b) | Yes |
+
+Both designs allocate the first 60 participants with the same square-root rule as the fixed design. From n = 60 onwards, an interim analysis is carried out every 30 participants. @fig-flowchart summarizes one interim analysis; the three steps below go through it.
+
+```{r}
+#| label: fig-flowchart
+#| fig-width: 8.5
+#| fig-height: 8
+#| fig-cap: "One interim analysis in adaptive designs (b) and (c). Dashed arrows: an action on that arm, after which the analysis continues. Arrows to red boxes: the trial stops."
+plot_flowchart()
+```
+
+### Step 1: update the posteriors and apply the rules
+
+At each analysis, each experimental arm $k$ is compared with the **current control** $c$. At the start, $c$ is the original control, arm 0; after a promotion (see below), $c$ is the promoted experimental arm. Three checks are carried out (how $x$ is set for the adaptive designs is explained below):
+
+- **Inferiority:** if $P(p_k > p_c \mid \text{data}) < 1 - x$, arm $k$ is convincingly worse, and it is **dropped**.
+- **Superiority:** if $P(p_k > p_c \mid \text{data}) > x$, arm $k$ is convincingly better than the current control. It becomes the **new control**, and the old control is dropped. If more than one arm beats the current control, the arm with the highest $P(p_k > p_c \mid \text{data})$ becomes the new control. The remaining arms are then checked again against the new control.
+- **Futility:** if $P(p_k - p_0 < 0.05 \mid \text{data}) > 0.90$, arm $k$ is unlikely to beat the original control by a clinically relevant 5 percentage points, and it is **dropped**. This check is only made until the first promotion; after that, arms are dropped only for inferiority.
+
+When only one arm is left, or the maximum sample size is reached, the trial stops.
+
+### Step 2: allocate the next participants
+
+After the decisions, the allocation probabilities for the next 30 participants are set.
+
+- **Design (b)** keeps the same allocation probabilities until an arm is dropped. A dropped arm gets no more participants; from then on, new participants are randomized over the remaining arms only. If an experimental arm is promoted to control, it takes over the control's share.
+- **Design (c)** recalculates the allocation probabilities at every analysis. The control keeps a protected share, and the rest goes mostly to the experimental arms with the highest probability of being the best arm, $P(p_k = \max_j p_j \mid \text{data})$.
+
+::: {.callout-note collapse="true" title="Details: allocation rules"}
+**Design (b).** When an arm is dropped, the control's weight is recalculated with the square-root rule for the number of experimental arms still active, while each remaining experimental arm keeps its starting weight. The weights are then rescaled to sum to 1. The control therefore gains the most: its share grows from `r pct(ctrl_share_b[1])` with five experimental arms to `r pct(ctrl_share_b[4])` with two. (Applying the square-root rule to all remaining arms would instead give the control `r pct(single$alloc_fixed[["Control share (pure square-root rule)"]][4])` with two experimental arms.)
+
+**Design (c).** At each analysis:
+
+1.  the control gets the square-root share for the number of experimental arms still active;
+2.  the rest is split among the active experimental arms in proportion to $P(p_k = \max_j p_j \mid \text{data})^{0.7}$ (the power $0.7 < 1$ "softens" the shares toward equal allocation, so that early noise does not cause wild swings [@thall2007]), with a minimum share for each active experimental arm: `r pct(min_share_c[1])` at the start, rescaled upward as arms are dropped (`r pct(min_share_c[4])` with two arms left).
+
+The probability of being best is computed among all active arms, including the control; only the shares of the experimental arms depend on it.
+
+**Settings in adaptr.** In `adaptr::setup_trial_binom()`, design (b) uses `control_prob_fixed = "sqrt-based fixed"`. Design (c) uses `control_prob_fixed = "sqrt-based"`, `soften_power = 0.7`, `min_probs = 0.05` for each experimental arm and `rescale_probs = "limits"`.
+:::
+
+### Step 3: the final decision
+
+A trial ends in one of two ways:
+
+- **One arm is left.** If it is an experimental arm, this is a **go**.
+- **The maximum of 300 is reached with several arms still active.** If the original control is still in the trial, it is a **no-go**. If the original control has been dropped, which means some arm beat it based on superiority, the active arm with the highest probability of being best is selected and is a **go**.
+
+### A simulated example trial
+
+@fig-anatomy shows one simulated trial under the two adaptive designs. In this trial, arm E truly works (response rate 40%, all other arms 15%). Up to the first analysis both designs see the same participants; after that they diverge. In design (c), RAR quickly sends more participants to the arms that look best so far, and one useless arm is dropped for futility early on. E beats the control at n = `r n_at("promoted to control")` and becomes the new control. The remaining arms are then dropped one by one as it becomes clear that they are worse than E, and the trial stops with E as the winner at n = `r n_at("declared winner")`, well before the maximum of 300. In design (b), E also beats the control, but later (n = `r n_at("promoted to control", ev_b)`). Two useless arms are never dropped, so the trial runs to the maximum of 300 and then takes E forward.
+
+```{r}
+#| label: fig-anatomy
+#| fig-width: 10
+#| fig-height: 8
+#| fig-cap: "One simulated trial. Top: events (vertical lines, color = arm). Middle: how the next set of participants is divided over the active arms (one stacked bar per interval between analyses). Bottom: each arm's probability of being better than the current control, with the thresholds x and 1 - x as dashed lines."
+plot_anatomy(single$typical$hists, single$typical$thr, single$max_n)
+```
+
+## Calibrating the designs {#calibrating-the-designs}
+
+For each design, we choose the threshold $x$ such that the false-go rate in the null scenario ("No arm works") is at most `r pct(cal$settings$target)`. Recall that $x$ is how sure we need to be that an arm is better than the (current) control before it beats the control: an arm beats the control if $P(p_k > p_c \mid \text{data}) > x$. In the adaptive designs, $1 - x$ is also the inferiority threshold: an arm is dropped if $P(p_k > p_c \mid \text{data}) < 1 - x$.
+
+The false-go rate is found by simulation: for a candidate value $x$, we simulate `r n0(cal$settings$n_rep_calib)` trials under the null scenario and count how often an arm other than the control is taken forward. A search algorithm (`adaptr::calibrate_trial()`) repeats this until the false-go rate is at or just below `r pct(cal$settings$target)`, and the threshold is then rounded up to four decimals.
+
+The table below gives the thresholds for the three designs. Because adaptive designs look at the data several times, they need a stricter threshold than the fixed design to end up at the same false-go rate. The thresholds are `r round(thr[[D_b]], 3)` for (b) and `r round(thr[[D_c]], 3)` for (c), versus `r round(thr[[D_a]], 3)` for the fixed design.
+
+```{r}
+#| label: thresholds
+thr_tab |>
+  filter(Design %in% design_names) |>
+  transmute(`Superiority threshold` = formatC(`Superiority threshold`, format = "f", digits = 4),
+            `Inferiority threshold` = ifelse(Design == D_a, "-",
+                                             formatC(`Inferiority threshold`, format = "f", digits = 4)),
+            Design = unname(design_lab[Design])) |>
+  select(Design, everything()) |>
+  knitr::kable(align = "lrr")
+```
+
+# Comparing designs under different scenarios
+
+Each design was simulated `r n0(scen$pick_the_winner$n_rep)` times in each of the three scenarios introduced in [The trial](#the-trial).
+
+## Results
+
+<!-- The Monte Carlo standard error of an estimated probability is then at most `r round(100 * mc_se_max, 1)` percentage points, so differences of about a percentage point are within simulation noise. "No arm works" is the null scenario used for calibration, so there the false-go rate is at or just below `r pct(cal$settings$target)` by construction. -->
+@fig-scenarios and the table below summarize the operating characteristics of each design in each scenario. The figure shows six metrics, all on a 0–100% scale where **bigger is better**:
+
+- **Power**, the share of trials in which the best arm is taken forward, and **avoiding a false go**, one minus the share of trials in which an arm that is no better than the control is taken forward;
+- **a conclusive decision**: only one arm is left at the end, rather than reaching the maximum sample size with several arms still active (for the fixed design, this happens only if all other arms are dropped at its single analysis);
+- **sample size saved**: one minus the expected sample size as a share of the maximum;
+- **participant benefit**: the share of trial participants randomized to the best arm, and the response rate among all trial participants.
+
+The table gives four key metrics on their original scale: the expected sample size, power, the false-go rate, and the probability of a no-go (the control is kept). Metrics that need a best arm are left out of the "No arm works" scenario.
+
+```{r}
+#| label: fig-scenarios
+#| fig-width: 9
+#| fig-height: 6.5
+#| fig-cap: "Performance by scenario. Metrics are all on a 0–100% scale where bigger is better."
+gl <- imap(scen, \(x, id) glance_data(x) |> mutate(scenario = x$title)) |> list_rbind() |>
+  # estimation is left for a later post (see the end of the takeaways)
+  filter(metric != "Estimation accuracy (relative)")
+plot_scenarios(gl, scenarios = map_chr(scen, "title"), designs = design_names) +
+  # label the designs as in the text: (a), (b), (c)
+  scale_colour_manual(values = design_cols, breaks = design_names, labels = unname(design_lab)) +
+  scale_shape_manual(values = set_names(c(16, 17, 15), design_names), breaks = design_names,
+                     labels = unname(design_lab))
+```
+
+```{r}
+#| label: key-table
+key <- c(ess, pow, fg, nogo)
+key_tab <- imap(scen, \(x, id) metric_table(x) |>
+       select(Metric, any_of(design_names)) |>
+       filter(Metric %in% key) |>
+       # short scenario name; the true response rates are in the scenario table
+       mutate(Scenario = if_else(row_number() == 1, sub(" \\(.*", "", x$title), ""),
+              .before = 1)) |>
+  list_rbind() |>
+  rename(any_of(set_names(design_names, design_lab)))
+k <- knitr::kable(key_tab, format = "pipe", align = "llrrr",
+                  caption = "Key metrics per scenario")
+# relative column widths (pandoc reads them from the dashes): narrow scenario, wide metric
+sep <- grep("^\\|[-: |]+\\|$", k)
+k[sep] <- "|:-----------|:--------------------------------------|---------:|---------:|---------------:|"
+k
+```
+
+## Main takeaways per scenario
+
+**Pick the winner (E works, four arms are useless).** This is the setting adaptive designs are made for. Design (c) has a power of `r pct(v("pick_the_winner", D_c, pow))` (E is taken forward), compared with `r pct(v("pick_the_winner", D_a, pow))` for the fixed design, and uses `r n0(v("pick_the_winner", D_c, ess))` participants on average instead of 300. Design (b) saves participants too (`r n0(v("pick_the_winner", D_b, ess))` on average), but has slightly *lower* power than the fixed design (`r pct(v("pick_the_winner", D_b, pow))`), because its stricter threshold costs some power (the difference is larger than the simulation error). 
+
+Design (c) seems to do better than design (b) because RAR sends more participants to E early on. Between n = 60 and 90, the median share of new participants going to E is `r pct(alloc_E(D_c, 90))` in design (c) versus `r pct(alloc_E(D_b, 90))` in design (b). E therefore beats the control sooner and more often before the maximum, and the share of trials ending in a no-go drops from `r pct(v("pick_the_winner", D_b, nogo))` in design (b) to `r pct(v("pick_the_winner", D_c, nogo))` in design (c). Over the whole trial, E gets about as many participants in (b) as in (c) (`r n0(arm_mean_n("pick_the_winner", D_b, "E"))` versus `r n0(arm_mean_n("pick_the_winner", D_c, "E"))` on average), because in (b) a promoted E takes over the control's large share, but this happens late.
+
+@fig-history shows this over the course of the trial, across `r n0(cal$settings$n_rep_history)` simulated trials per design. In design (c), the share of new participants going to E rises right after the first analysis; in design (b), it stays at its starting value until arms are dropped or E becomes the new control.
+
+```{r}
+#| label: fig-history
+#| fig-width: 10
+#| fig-height: 4
+#| fig-cap: "Pick the winner: allocation probabilities over the course of the trial (computed with adaptr::plot_history()). Line: median; band: middle 50% of trials. Each point refers to the trials still running at that sample size; a dropped arm has probability 0."
+plot_history_data(set_names(single$history, design_lab[names(single$history)]))
+```
+
+**No arm works.** All three designs take a useless arm forward in `r pct(v("futility_screen", D_a, fg), 0.1)`, `r pct(v("futility_screen", D_b, fg), 0.1)` and `r pct(v("futility_screen", D_c, fg), 0.1)` of trials (fixed, b, c), at or just below the `r pct(cal$settings$target)` target, as calibrated. The adaptive designs save only a few participants here (`r n0(v("futility_screen", D_b, ess))` and `r n0(v("futility_screen", D_c, ess))` versus 300). Dropping an arm does not shorten the trial, because its places go to the other arms; the trial only stops early once one arm is left. That happens in just `r pct(conc("futility_screen", D_b))` (b) and `r pct(conc("futility_screen", D_c))` (c) of trials: with arms of 15% and a 5-point futility margin, evidence that *every* arm is futile accumulates slowly.
+
+**Close effects (E 25%, D 20%).** Every design struggles: power is only `r pct(min(map_dbl(design_names, \(d) v("close_effects", d, pow))))`–`r pct(max(map_dbl(design_names, \(d) v("close_effects", d, pow))))`, and most trials end in a no-go (`r pct(min(map_dbl(design_names, \(d) v("close_effects", d, nogo))))`–`r pct(max(map_dbl(design_names, \(d) v("close_effects", d, nogo))))`). A 10-point difference is simply too small for 300 participants spread over six arms, and adaptation cannot fix an underpowered trial.
+
+**Participant benefit.** When an arm works, the adaptive designs put more of the trial's participants on it. In pick the winner, the share of participants randomized to E is `r pct(share_best("pick_the_winner", D_a))` in the fixed design, `r pct(share_best("pick_the_winner", D_b))` in design (b) and `r pct(share_best("pick_the_winner", D_c))` in design (c), and the response rate among all trial participants rises from `r pct(resp_rate("pick_the_winner", D_a))` to `r pct(resp_rate("pick_the_winner", D_b))` and `r pct(resp_rate("pick_the_winner", D_c))`. In design (b), most of this gain comes late, after E has beaten the control and taken over the control's share; RAR in design (c) shifts participants to E earlier. With close effects the gains are smaller: the share on E is `r pct(share_best("close_effects", D_a))`, `r pct(share_best("close_effects", D_b))` and `r pct(share_best("close_effects", D_c))`, and the response rate `r pct(resp_rate("close_effects", D_a), 0.1)`, `r pct(resp_rate("close_effects", D_b), 0.1)` and `r pct(resp_rate("close_effects", D_c), 0.1)` (fixed, b, c). When no arm works, there is nothing to gain: every participant has the same `r pct(s6$null_rate)` chance of response, whatever the design.
+
+## What this post leaves out
+
+The goal of this post was to use simple settings to show how adaptive designs work, so many aspects are left out. Here are some of them...
+
+**Estimation.** After a go, the trial also gives an estimate of how much better the selected arm is. That estimate tends to be too high in every design, because an arm is only taken forward when it looks good. In the pick-the-winner scenario, the adaptive designs make this somewhat worse: they tend to stop when the winner looks unusually good, and with fewer participants their estimates are noisier. (With close effects it is the other way around, because the fixed design only says go when its estimate is extreme.) How large this bias is, and what can be done about it, may be a topic for a later post.
+
+**Other design choices.** The simulations assume that each outcome is known before the next analysis; with delayed outcomes, interim decisions are based on less information. They also assume that response rates stay constant during the trial. In practice, rates can drift (for example, as the population enrolled changes), which can bias comparisons when allocation probabilities change over time, as with RAR. Finally, the futility margin (5 percentage points), the futility probability (0.90), the interim schedule and the RAR settings were fixed here. They all affect the operating characteristics, and a real design would explore them.
+
+And then of course there is the **prior** on $p_k$! We used a uniform $\text{Beta}(1, 1)$ for every arm, but other priors (say, an informative prior for the control based on historical data) change the posterior probabilities, and with them the operating characteristics and the calibrated threshold. More on that in a later post for sure!
+
+# Summary
+
+Adaptive designs look at the data as they come in and act on them. In this example, that pays off most when one arm clearly works: with response-adaptive randomization, design (c) takes the best arm forward more often than the fixed design (`r pct(v("pick_the_winner", D_c, pow))` versus `r pct(v("pick_the_winner", D_a, pow))`), with fewer participants (`r n0(v("pick_the_winner", D_c, ess))` versus 300 on average), and puts more of the trial's participants on the better treatment. When no arm works, or when effects are small, the gains are small: adaptation does not fix a trial that is too small for its question. 
+
+**Code.** All code for this post is in the [`adaptive-designs/`](https://github.com/leontinealkema/bayes-trials-sandbox/tree/main/adaptive-designs) folder of the repository: `run_all.R` runs and caches all simulations, `R/helpers.R` holds the helper functions, and this post only reads the saved results in `results/`.
+
+# References
+
+::: {#refs}
+:::

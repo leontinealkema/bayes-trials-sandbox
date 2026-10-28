@@ -1,0 +1,20 @@
+# Large or private files (per topic folder)
+sims/
+private/
+
+claude-project-context.md
+
+# Rendered output (rebuild with quarto)
+*.html
+*.pdf
+# keep the figures of the .md (GitHub) version of a post
+**/*_files/*
+!**/*_files/figure-commonmark/
+.quarto/
+_site/
+
+# R / RStudio / OS
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store
